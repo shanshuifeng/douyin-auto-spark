@@ -24,69 +24,72 @@ async function main(): Promise<void> {
     ...(browserPath ? { executablePath: browserPath } : {}),
   })
 
-  const context = await browser.newContext()
-  await context.addCookies(douyinCookies)
+  try {
+    const context = await browser.newContext()
+    await context.addCookies(douyinCookies)
 
-  const page = await context.newPage()
-  await page.goto('https://www.douyin.com/chat', {
-    waitUntil: 'domcontentloaded',
-  })
-
-  await page.waitForTimeout(10000)
-
-  const searchInput = page.locator('input.semi-input[placeholder="搜索"]').first()
-  await searchInput.waitFor({ state: 'visible', timeout: 10000 })
-
-  for (const targetName of targetNames) {
-    const name = String(targetName).trim()
-    if (!name) continue
-
-    console.log(`开始搜索会话：${name}`)
-    await searchInput.fill('')
-    await searchInput.fill(name)
-    await page.waitForTimeout(1000)
-
-    const searchResult = page
-      .locator('.SearchPanelitembox')
-      .filter({
-        has: page.getByText(name, { exact: true }),
-      })
-      .first()
-
-    if (!(await searchResult.isVisible({ timeout: 5000 }).catch(() => false))) {
-      console.log(`找不到搜索结果，已跳过：${name}`)
-      continue
-    }
-
-    await searchResult.getByText(/^(发消息|发私信)$/).click({ timeout: 5000 })
-    console.log(`已打开私信：${name}`)
-
-    const editorInput = page
-      .locator(
-        '.messageEditorimChatEditorContainer [data-slate-editor="true"][contenteditable="true"]',
-      )
-      .first()
-    await editorInput.waitFor({ state: 'visible', timeout: 10000 })
-    await editorInput.click()
-    await page.keyboard.insertText(pickRandomYiyan(yiyans).hitokoto)
-    await page.keyboard.press('Enter')
-    console.log(`已发送消息：${name}`)
-    await page.waitForTimeout(1000)
-  }
-
-  await page.waitForTimeout(5000)
-
-  if (!autoClose) {
-    const readline = createInterface({
-      input,
-      output,
+    const page = await context.newPage()
+    await page.goto('https://www.douyin.com/chat', {
+      waitUntil: 'domcontentloaded',
     })
 
-    await readline.question('Chrome 已打开抖音聊天页，按回车键关闭浏览器...')
-    readline.close()
-  }
+    await page.waitForTimeout(10000)
 
-  await browser.close()
+    const searchInput = page.locator('input.semi-input[placeholder="搜索"]').first()
+    await searchInput.waitFor({ state: 'visible', timeout: 10000 })
+
+    for (const targetName of targetNames) {
+      const name = String(targetName).trim()
+      if (!name) continue
+
+      console.log(`开始搜索会话：${name}`)
+      await searchInput.fill('')
+      await searchInput.fill(name)
+      await page.waitForTimeout(1000)
+
+      const searchResult = page
+        .locator('.SearchPanelitembox')
+        .filter({
+          has: page.getByText(name, { exact: true }),
+        })
+        .first()
+
+      if (!(await searchResult.isVisible({ timeout: 5000 }).catch(() => false))) {
+        console.log(`找不到搜索结果，已跳过：${name}`)
+        continue
+      }
+
+      await searchResult.getByText(/^(发消息|发私信)$/).click({ timeout: 5000 })
+      console.log(`已打开私信：${name}`)
+
+      const editorInput = page
+        .locator(
+          '.messageEditorimChatEditorContainer [data-slate-editor="true"][contenteditable="true"]',
+        )
+        .first()
+      await editorInput.waitFor({ state: 'visible', timeout: 10000 })
+      await editorInput.click()
+      await page.keyboard.insertText(pickRandomYiyan(yiyans).hitokoto)
+      await page.keyboard.press('Enter')
+      console.log(`已发送消息：${name}`)
+      await page.waitForTimeout(1000)
+    }
+
+    await page.waitForTimeout(5000)
+
+    if (!autoClose) {
+      const readline = createInterface({
+        input,
+        output,
+      })
+
+      await readline.question('Chrome 已打开抖音聊天页，按回车键关闭浏览器...')
+      readline.close()
+    }
+  } finally {
+    // 无论任务是否失败，都关闭浏览器以释放 Playwright 持有的进程句柄。
+    await browser.close()
+  }
 }
 
 /**
