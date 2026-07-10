@@ -58,7 +58,7 @@ async function main(): Promise<void> {
       continue
     }
 
-    await searchResult.getByText('发私信', { exact: true }).click({ timeout: 5000 })
+    await searchResult.getByText(/^(发消息|发私信)$/).click({ timeout: 5000 })
     console.log(`已打开私信：${name}`)
 
     const editorInput = page
