@@ -95,10 +95,15 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 
 添加以下 secrets：
 
-| Secret | 说明 |
-|:---|:---|
-| `DOUYIN_COOKIE` | 抖音 Cookie JSON 字符串数组 （上面用浏览器插件获取的那个） |
-| `DOUYIN_TARGET_NAMES` | 需要续火的朋友的用户名称， JSON 字符串数组，例如 ["暮邵落白"] （不会写 JSON 可以问 AI） |
+| Secret | 必填 | 说明 |
+|:---|:---:|:---|
+| `DOUYIN_COOKIE` | ✅ | 抖音 Cookie JSON 字符串数组 （上面用浏览器插件获取的那个） |
+| `DOUYIN_TARGET_NAMES` | ✅ | 需要续火的朋友的用户名称， JSON 字符串数组，例如 ["暮邵落白"] （不会写 JSON 可以问 AI） |
+| `MAIL_ADDRESS` | ❌ | 任务失败提醒的收件邮箱，同时作为邮件发件人地址 |
+| `MAIL_USERNAME` | ❌ | QQ 邮箱 SMTP 登录账号，通常与 `MAIL_ADDRESS` 相同 |
+| `MAIL_PASSWORD` | ❌ | QQ 邮箱 SMTP 授权码 |
+
+配置 `MAIL_ADDRESS`、`MAIL_USERNAME` 和 `MAIL_PASSWORD` 后，续火失败会向 `MAIL_ADDRESS` 发送提醒邮件。
 
 #### 3️⃣ 手动运行一次
 
