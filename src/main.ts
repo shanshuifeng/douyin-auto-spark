@@ -1,6 +1,6 @@
 import 'dotenv/config'
-import { chromium, type Cookie } from 'playwright'
-import { readFile } from 'node:fs/promises'
+import { chromium, type Cookie, type Page } from 'playwright'
+import { mkdir, readFile } from 'node:fs/promises'
 import { createInterface } from 'node:readline/promises'
 import { stdin as input, stdout as output } from 'node:process'
 import type { DouyinCookie, SameSite } from './types/douyin-cookie'
@@ -8,6 +8,8 @@ import type { Yiyan } from './types/yiyan'
 
 const DOUYIN_COOKIE_KEY = 'DOUYIN_COOKIE'
 const DOUYIN_TARGET_NAMES_KEY = 'DOUYIN_TARGET_NAMES'
+const YIYAN_INCLUDE_SOURCE_KEY = 'YIYAN_INCLUDE_SOURCE'
+const FAILURE_SCREENSHOT_PATH = 'artifacts/failure-screenshot.png'
 
 /**
  * 启动本机 Chrome 浏览器并携带 Cookie 访问抖音聊天页。
@@ -16,6 +18,7 @@ async function main(): Promise<void> {
   const browserPath = resolveBrowserPath()
   const headless = resolveHeadless()
   const autoClose = resolveAutoClose()
+  const includeYiyanSource = resolveYiyanIncludeSource()
   const douyinCookies = resolveDouyinCookies()
   const targetNames = resolveDouyinTargetNames()
   const yiyans = await resolveYiyans()
@@ -23,12 +26,13 @@ async function main(): Promise<void> {
     headless,
     ...(browserPath ? { executablePath: browserPath } : {}),
   })
+  let page: Page | undefined
 
   try {
     const context = await browser.newContext()
     await context.addCookies(douyinCookies)
 
-    const page = await context.newPage()
+    page = await context.newPage()
     await page.goto('https://www.douyin.com/chat', {
       waitUntil: 'domcontentloaded',
     })
@@ -69,7 +73,9 @@ async function main(): Promise<void> {
         .first()
       await editorInput.waitFor({ state: 'visible', timeout: 10000 })
       await editorInput.click()
-      await page.keyboard.insertText(pickRandomYiyan(yiyans).hitokoto)
+      const yiyan = pickRandomYiyan(yiyans)
+      const message = includeYiyanSource ? `${yiyan.hitokoto}\n——「${yiyan.from}」` : yiyan.hitokoto
+      await page.keyboard.insertText(message)
       await page.keyboard.press('Enter')
       console.log(`已发送消息：${name}`)
       await page.waitForTimeout(1000)
@@ -86,9 +92,32 @@ async function main(): Promise<void> {
       await readline.question('Chrome 已打开抖音聊天页，按回车键关闭浏览器...')
       readline.close()
     }
+  } catch (error) {
+    await captureFailureScreenshot(page)
+    throw error
   } finally {
     // 无论任务是否失败，都关闭浏览器以释放 Playwright 持有的进程句柄。
     await browser.close()
+  }
+}
+
+/**
+ * 在页面仍可访问时保存失败现场，且不让截图错误覆盖原始任务异常。
+ */
+async function captureFailureScreenshot(page: Page | undefined): Promise<void> {
+  if (!page || page.isClosed()) {
+    return
+  }
+
+  try {
+    await mkdir('artifacts', { recursive: true })
+    await page.screenshot({
+      path: FAILURE_SCREENSHOT_PATH,
+      fullPage: true,
+    })
+    console.log(`已保存失败截图：${FAILURE_SCREENSHOT_PATH}`)
+  } catch (error) {
+    console.error('保存失败截图失败:', error)
   }
 }
 
@@ -145,6 +174,23 @@ function resolveAutoClose(): boolean {
   }
 
   throw new Error('AUTO_CLOSE 只能配置为 true 或 false')
+}
+
+/**
+ * 解析发送一言时是否携带出处。
+ */
+function resolveYiyanIncludeSource(): boolean {
+  const includeSource = process.env[YIYAN_INCLUDE_SOURCE_KEY]?.trim().toLowerCase()
+
+  if (!includeSource || includeSource === 'true') {
+    return true
+  }
+
+  if (includeSource === 'false') {
+    return false
+  }
+
+  throw new Error(`${YIYAN_INCLUDE_SOURCE_KEY} 只能配置为 true 或 false`)
 }
 
 /**

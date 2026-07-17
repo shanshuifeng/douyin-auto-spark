@@ -32,6 +32,7 @@ jobs:
         env:
           DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
           DOUYIN_TARGET_NAMES: ${{ secrets.DOUYIN_TARGET_NAMES }}
+          YIYAN_INCLUDE_SOURCE: ${{ secrets.YIYAN_INCLUDE_SOURCE }}
         run: bun src/main.ts
 
       - name: 发送失败邮件 (Send failure email)
@@ -46,10 +47,13 @@ jobs:
           subject: 抖音续火任务失败
           to: ${{ secrets.MAIL_ADDRESS }}
           from: ${{ secrets.MAIL_ADDRESS }}
+          attachments: artifacts/failure-screenshot.png
           body: |
             抖音续火任务执行失败
             仓库：${{ github.repository }}
             运行链接：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            如确认配置无误后仍然失败，请在上游仓库发送 issue：
+            https://github.com/bling-yshs/douyin-auto-spark/issues
 
 #      - name: Setup tmate session
 #        uses: mxschmitt/action-tmate@v3

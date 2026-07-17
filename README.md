@@ -17,7 +17,7 @@
 
 ## ✨ 项目简介
 
-本项目是一个基于 **Playwright + TypeScript** 的抖音聊天自动化脚本。它会携带你配置的抖音 Cookie 打开聊天页，按配置的会话名称依次定位聊天对象，并从 `assets/yiyan.json` 中随机挑选一句 `hitokoto` 发送出去。
+本项目是一个基于 **Playwright + TypeScript** 的抖音聊天自动化脚本。它会携带你配置的抖音 Cookie 打开聊天页，按配置的会话名称依次定位聊天对象，并从 `assets/yiyan.json` 中随机挑选一言发送出去。
 
 适合放到 GitHub Actions 中定时运行，也可以在本地用 `pnpm dev` 手动执行。
 
@@ -25,7 +25,7 @@
 
 - 🎭 **Cookie 登录** - 通过 `DOUYIN_COOKIE` 注入抖音登录态，无需脚本内输入账号密码
 - 🎯 **多会话发送** - 通过 `DOUYIN_TARGET_NAMES` 配置多个聊天对象
-- 💬 **随机一言** - 每次从 `assets/yiyan.json` 随机挑选一条 `hitokoto` 作为消息内容
+- 💬 **随机一言** - 每次从 `assets/yiyan.json` 随机挑选一条 `hitokoto`，默认以 `——「出处」` 的格式附上来源
 - 🤖 **定时续火** - 通过 Github Action 每天 0 点自动续火（但是 Github 定时任务要排队，可能会延迟几个小时）
 
 ## 🧰 准备工作
@@ -99,11 +99,12 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 |:---|:---:|:---|
 | `DOUYIN_COOKIE` | ✅ | 抖音 Cookie JSON 字符串数组 （上面用浏览器插件获取的那个） |
 | `DOUYIN_TARGET_NAMES` | ✅ | 需要续火的朋友的用户名称， JSON 字符串数组，例如 ["暮邵落白"] （不会写 JSON 可以问 AI） |
+| `YIYAN_INCLUDE_SOURCE` | ❌ | 是否携带一言出处，默认开启；设置为 `false` 时只发送正文 |
 | `MAIL_ADDRESS` | ❌ | 任务失败提醒的收件邮箱，同时作为邮件发件人地址 |
 | `MAIL_USERNAME` | ❌ | QQ 邮箱 SMTP 登录账号，通常与 `MAIL_ADDRESS` 相同 |
 | `MAIL_PASSWORD` | ❌ | QQ 邮箱 SMTP 授权码 |
 
-配置 `MAIL_ADDRESS`、`MAIL_USERNAME` 和 `MAIL_PASSWORD` 后，续火失败会向 `MAIL_ADDRESS` 发送提醒邮件。
+配置 `MAIL_ADDRESS`、`MAIL_USERNAME` 和 `MAIL_PASSWORD` 后，续火失败会向 `MAIL_ADDRESS` 发送提醒邮件，并附带失败图片。
 
 #### 3️⃣ 手动运行一次
 
@@ -139,6 +140,7 @@ cp .env.example .env
 |:---|:---:|:---:|:---|
 | `DOUYIN_COOKIE` | ✅ | - | 抖音 Cookie JSON 字符串数组 |
 | `DOUYIN_TARGET_NAMES` | ✅ | - | 要发送消息的会话名称 JSON 字符串数组 |
+| `YIYAN_INCLUDE_SOURCE` | ❌ | `true` | 是否携带一言出处，设置为 `false` 时只发送正文 |
 | `PLAYWRIGHT_BROWSER_PATH` | ❌ | - | 本机 Chrome / Chromium / Edge 可执行文件路径，不填则使用 Playwright 默认浏览器 |
 | `PLAYWRIGHT_HEADLESS` | ❌ | `true` | 是否使用无头模式 |
 | `AUTO_CLOSE` | ❌ | `true` | 发送完成后是否自动关闭浏览器 |
