@@ -33,6 +33,7 @@ jobs:
           DOUYIN_ACCOUNTS: ${{ secrets.DOUYIN_ACCOUNTS }}
           DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
           DOUYIN_TARGET_NAMES: ${{ secrets.DOUYIN_TARGET_NAMES }}
+          DOUYIN_TARGET_GROUPS: ${{ secrets.DOUYIN_TARGET_GROUPS }}
           YIYAN_INCLUDE_SOURCE: ${{ secrets.YIYAN_INCLUDE_SOURCE }}
           SPARK_MESSAGE_TEMPLATE: ${{ secrets.SPARK_MESSAGE_TEMPLATE }}
         run: bun src/main.ts

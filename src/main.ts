@@ -17,6 +17,7 @@ dayjs.locale('zh-cn')
 const DOUYIN_ACCOUNTS_KEY = 'DOUYIN_ACCOUNTS'
 const DOUYIN_COOKIE_KEY = 'DOUYIN_COOKIE'
 const DOUYIN_TARGET_NAMES_KEY = 'DOUYIN_TARGET_NAMES'
+const DOUYIN_TARGET_GROUPS_KEY = 'DOUYIN_TARGET_GROUPS'
 const YIYAN_INCLUDE_SOURCE_KEY = 'YIYAN_INCLUDE_SOURCE'
 const SPARK_MESSAGE_TEMPLATE_KEY = 'SPARK_MESSAGE_TEMPLATE'
 const FAILURE_SCREENSHOT_DIRECTORY = 'artifacts'
@@ -27,6 +28,9 @@ const SEARCH_RESULT_TIMEOUT = 5000
 const SEARCH_RETRY_LIMIT = 3
 const SEARCH_RETRY_INTERVAL = 2000
 const SEARCH_INPUT_RESET_DELAY = 500
+// 等待搜索结果里的「发消息 / 发私信」按钮出现。群聊条目没有这个按钮，
+// 因此这个超时不能太长，否则每个群聊都要白等一轮才走点击条目的兜底逻辑。
+const CONVERSATION_ACTION_TIMEOUT = 3000
 
 const MESSAGE_TEMPLATE_PLACEHOLDER_PATTERN = /\{\{\s*([a-zA-Z]+)\s*\}\}/g
 const MESSAGE_TEMPLATE_PLACEHOLDERS = [
@@ -41,10 +45,22 @@ const MESSAGE_TEMPLATE_PLACEHOLDERS = [
 
 type MessageTemplatePlaceholder = (typeof MESSAGE_TEMPLATE_PLACEHOLDERS)[number]
 
+type ChatTargetKind = 'friend' | 'group'
+
+interface ChatTarget {
+  /** 会话名称：好友昵称/备注名，或群名称 */
+  name: string
+  /** 会话类型，决定日志文案、失败排查建议与失败截图文件名 */
+  kind: ChatTargetKind
+}
+
 interface DouyinAccount {
   name: string
   cookies: Cookie[]
+  /** 需要续火的好友会话名 */
   targetNames: string[]
+  /** 需要发消息的群名称，未配置时为空数组 */
+  groupNames: string[]
   messageTemplate: string | undefined
 }
 
@@ -138,26 +154,29 @@ async function runDouyinAccount(
 
     await waitForChatListReady(page, account.name)
 
-    // 记录未命中的会话，等其余好友都发完再统一报错，避免一个人改名连累当天所有人。
-    const missingNames: string[] = []
+    // 记录未命中的会话，等其余目标都发完再统一报错，避免一个人改名连累当天所有人。
+    const missingTargets: ChatTarget[] = []
     const needsYiyan =
       account.messageTemplate === undefined ||
       /\{\{\s*(yiyan|from)\s*\}\}/.test(account.messageTemplate)
 
-    for (const targetName of account.targetNames) {
-      console.log(`[${account.name}] 开始搜索会话：${targetName}`)
+    for (const target of resolveChatTargets(account)) {
+      const { name: targetName, kind } = target
+      const targetLabel = kind === 'group' ? '群聊' : '好友'
+
+      console.log(`[${account.name}] 开始搜索${targetLabel}：${targetName}`)
 
       const searchResult = await searchConversation(page, searchInput, account.name, targetName)
 
       if (!searchResult) {
-        await captureFailureScreenshot(page, `${account.name}-${targetName}-search`)
-        console.log(`[${account.name}] 找不到搜索结果，已跳过：${targetName}`)
-        missingNames.push(targetName)
+        await captureFailureScreenshot(page, `${account.name}-${kind}-${targetName}-search`)
+        console.log(`[${account.name}] 找不到搜索结果，已跳过${targetLabel}：${targetName}`)
+        missingTargets.push(target)
         continue
       }
 
-      await searchResult.getByText(/^(发消息|发私信)$/).click({ timeout: 5000 })
-      console.log(`[${account.name}] 已打开私信：${targetName}`)
+      await openConversation(searchResult, targetLabel)
+      console.log(`[${account.name}] 已打开会话：${targetName}`)
 
       const editorInput = page
         .locator(
@@ -189,12 +208,8 @@ async function runDouyinAccount(
 
     await page.waitForTimeout(5000)
 
-    if (missingNames.length > 0) {
-      throw new Error(
-        `以下会话未找到，火花可能已经中断：${missingNames.join('、')}。` +
-          `好友改昵称是最常见的原因，建议在抖音中为好友设置备注名，` +
-          `并把备注名填入账号的 targetNames，这样好友再改昵称也不会影响续火。`,
-      )
+    if (missingTargets.length > 0) {
+      throw new Error(describeMissingTargets(missingTargets))
     }
 
     console.log(`账号执行完成：${account.name}`)
@@ -206,6 +221,84 @@ async function runDouyinAccount(
       await context.close()
     }
   }
+}
+
+/**
+ * 把账号配置里的目标合并成统一列表：带身份信息的目标在前，兼容配置的好友、群聊在后。
+ *
+ * 三种来源只是配置写法不同，合并后共用同一套搜索、身份确认与发送逻辑。
+ *
+ * @param account 当前执行的抖音账号配置。
+ * @returns 按「targets → 好友 → 群聊」顺序排列的目标列表。
+ */
+function resolveChatTargets(account: DouyinAccount): ChatTarget[] {
+  return [
+    ...account.targetNames.map((name) => ({ name, kind: 'friend' as const })),
+    ...account.groupNames.map((name) => ({ name, kind: 'group' as const })),
+  ]
+}
+
+/**
+ * 打开搜索命中的会话。
+ *
+ * 好友条目里带「发消息 / 发私信」按钮，点击按钮才能进入私信；
+ * 群聊条目没有这个按钮，直接点条目本身即可进入群会话。
+ * 两种形态都存在，所以这里做两级兜底：先找按钮，找不到就点条目。
+ *
+ * @param searchResult 搜索命中的结果条目。
+ * @param targetLabel 用于日志的中文类型名（好友 / 群聊）。
+ * @returns 打开会话后的 Promise。
+ */
+async function openConversation(searchResult: Locator, targetLabel: string): Promise<void> {
+  const actionButton = searchResult.getByText(/^(发消息|发私信)$/).first()
+  const hasActionButton = await actionButton
+    .waitFor({ state: 'visible', timeout: CONVERSATION_ACTION_TIMEOUT })
+    .then(() => true)
+    .catch(() => false)
+
+  if (hasActionButton) {
+    await actionButton.click({ timeout: 5000 })
+    return
+  }
+
+  console.log(`未出现「发消息」按钮，直接点击条目进入${targetLabel}会话`)
+  await searchResult.click({ timeout: 5000 })
+}
+
+/**
+ * 汇总未命中的目标，并按好友、群聊分别给出排查建议。
+ *
+ * 两类目标失败原因差异较大：好友多半是改了昵称，群聊多半是群名不一致或已退群。
+ *
+ * @param missingTargets 本轮未命中的目标列表。
+ * @returns 面向用户的错误说明。
+ */
+function describeMissingTargets(missingTargets: ChatTarget[]): string {
+  const missingNames = missingTargets
+    .filter((target) => target.kind === 'friend')
+    .map((target) => target.name)
+  const missingGroups = missingTargets
+    .filter((target) => target.kind === 'group')
+    .map((target) => target.name)
+  const sections = ['以下会话未找到，火花可能已经中断：']
+
+  if (missingNames.length > 0) {
+    sections.push(
+      `好友：${missingNames.join('、')}。` +
+        `好友改昵称是最常见的原因，建议在抖音中为好友设置备注名，` +
+        `并把备注名填入账号的 targetNames，这样好友再改昵称也不会影响续火。`,
+    )
+  }
+
+  if (missingGroups.length > 0) {
+    sections.push(
+      `群聊：${missingGroups.join('、')}。` +
+        `请确认群名与抖音内显示的名称完全一致（标点、空格、表情都要一致），` +
+        `并确认你仍在群内、群没有被解散。`,
+    )
+  }
+
+  return sections.join('')
 }
 
 /**
@@ -469,12 +562,13 @@ function resolveDouyinAccounts(globalMessageTemplate: string | undefined): Douyi
 
   if (!accountsText) {
     return [
-      {
+      assertAccountHasTargets({
         name: '默认账号',
         cookies: resolveLegacyDouyinCookies(),
         targetNames: resolveLegacyDouyinTargetNames(),
+        groupNames: resolveLegacyDouyinTargetGroups(),
         messageTemplate: globalMessageTemplate,
-      },
+      }),
     ]
   }
 
@@ -501,16 +595,20 @@ function resolveDouyinAccounts(globalMessageTemplate: string | undefined): Douyi
     }
     accountNames.add(name)
 
-    return {
+    return assertAccountHasTargets({
       name,
       cookies: resolveCookieArray(accountValue.cookie, `${sourceName}.cookie`),
-      targetNames: resolveTargetNameArray(accountValue.targetNames, `${sourceName}.targetNames`),
+      targetNames: resolveOptionalTargetNames(
+        accountValue.targetNames,
+        `${sourceName}.targetNames`,
+      ),
+      groupNames: resolveOptionalTargetNames(accountValue.groupNames, `${sourceName}.groupNames`),
       messageTemplate: resolveAccountMessageTemplate(
         accountValue.messageTemplate,
         `${sourceName}.messageTemplate`,
         globalMessageTemplate,
       ),
-    }
+    })
   })
 }
 
@@ -555,21 +653,69 @@ function resolveLegacyDouyinCookies(): Cookie[] {
 }
 
 /**
- * 解析旧版单账号会话名称配置。
+ * 解析单账号配置里的好友会话名，未配置或配成空数组都表示不发好友。
  */
 function resolveLegacyDouyinTargetNames(): string[] {
-  const targetNamesText = process.env[DOUYIN_TARGET_NAMES_KEY]?.trim()
+  return resolveEnvTargetNames(DOUYIN_TARGET_NAMES_KEY)
+}
 
-  if (!targetNamesText) {
+/**
+ * 解析单账号配置里的群名称，未配置或配成空数组都表示不发群消息。
+ */
+function resolveLegacyDouyinTargetGroups(): string[] {
+  return resolveEnvTargetNames(DOUYIN_TARGET_GROUPS_KEY)
+}
+
+/**
+ * 从环境变量读取一组会话名称。
+ *
+ * 允许「留空」与「显式空数组」两种写法，这样只发群聊、不发好友的配置也能成立；
+ * 但类型写错（例如把数组写成字符串）仍然立刻报错，避免静默漏发。
+ */
+function resolveEnvTargetNames(key: string): string[] {
+  const text = process.env[key]?.trim()
+
+  if (!text) {
+    return []
+  }
+
+  return resolveOptionalTargetNames(parseJson(text, key), key)
+}
+
+/**
+ * 解析可选的会话名称数组：未配置或配置为空数组都视为「这类目标不发」。
+ *
+ * 与 resolveTargetNameArray 的区别是不强制非空，这样只发群聊、不发好友的配置也能成立；
+ * 但类型写错（例如把数组写成字符串）仍然立刻报错，避免静默漏发。
+ */
+function resolveOptionalTargetNames(value: unknown, sourceName: string): string[] {
+  if (value === undefined || value === null) {
+    return []
+  }
+
+  if (!Array.isArray(value)) {
+    throw new Error(`${sourceName} 必须是字符串数组`)
+  }
+
+  if (value.length === 0) {
+    return []
+  }
+
+  return resolveTargetNameArray(value, sourceName)
+}
+
+/**
+ * 校验账号至少配置了一个续火对象，好友与群聊全空时直接报错提示怎么配。
+ */
+function assertAccountHasTargets(account: DouyinAccount): DouyinAccount {
+  if (account.targetNames.length === 0 && account.groupNames.length === 0) {
     throw new Error(
-      `请设置环境变量 ${DOUYIN_TARGET_NAMES_KEY}，或在 .env 中配置 ${DOUYIN_TARGET_NAMES_KEY}`,
+      `账号「${account.name}」没有配置任何续火对象，` +
+        `请用 ${DOUYIN_TARGET_NAMES_KEY} 配置好友会话名，或用 ${DOUYIN_TARGET_GROUPS_KEY} 配置群名称`,
     )
   }
 
-  return resolveTargetNameArray(
-    parseJson(targetNamesText, DOUYIN_TARGET_NAMES_KEY),
-    DOUYIN_TARGET_NAMES_KEY,
-  )
+  return account
 }
 
 function resolveCookieArray(value: unknown, sourceName: string): Cookie[] {
