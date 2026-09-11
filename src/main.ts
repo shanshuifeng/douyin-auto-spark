@@ -32,6 +32,20 @@ const SEARCH_INPUT_RESET_DELAY = 500
 // 因此这个超时不能太长，否则每个群聊都要白等一轮才走点击条目的兜底逻辑。
 const CONVERSATION_ACTION_TIMEOUT = 3000
 
+// 发送前校验「右侧打开的会话是不是目标本人」：切换会话有延迟，不等标题变过来就输入会把消息发给上一个人。
+const CONVERSATION_TITLE_SELECTOR = '.RightPanelHeadertitle'
+const CONVERSATION_TITLE_TIMEOUT = 10000
+const TITLE_POLL_INTERVAL = 300
+
+const CHAT_EDITOR_SELECTOR =
+  '.messageEditorimChatEditorContainer [data-slate-editor="true"][contenteditable="true"]'
+const EDITOR_READY_TIMEOUT = 10000
+
+// 发送后校验消息确实发出去了：发出去了抖音会清空输入框，回车被吞时会留下残留内容。
+const SEND_VERIFY_TIMEOUT = 4000
+const SEND_VERIFY_INTERVAL = 300
+const SEND_ATTEMPT_LIMIT = 2
+
 const MESSAGE_TEMPLATE_PLACEHOLDER_PATTERN = /\{\{\s*([a-zA-Z]+)\s*\}\}/g
 const MESSAGE_TEMPLATE_PLACEHOLDERS = [
   'account',
@@ -52,6 +66,16 @@ interface ChatTarget {
   name: string
   /** 会话类型，决定日志文案、失败排查建议与失败截图文件名 */
   kind: ChatTargetKind
+}
+
+/** 单个目标的执行结果 */
+type TargetOutcome = 'sent' | 'skipped' | 'failed'
+
+interface TargetResult {
+  target: ChatTarget
+  outcome: TargetOutcome
+  /** 成功时的目标会话名，失败或未命中时的具体原因 */
+  detail: string
 }
 
 interface DouyinAccount {
@@ -154,62 +178,39 @@ async function runDouyinAccount(
 
     await waitForChatListReady(page, account.name)
 
-    // 记录未命中的会话，等其余目标都发完再统一报错，避免一个人改名连累当天所有人。
-    const missingTargets: ChatTarget[] = []
     const needsYiyan =
       account.messageTemplate === undefined ||
       /\{\{\s*(yiyan|from)\s*\}\}/.test(account.messageTemplate)
 
+    // 逐个目标独立执行：某一个目标出错不会中断后面的目标，结果统一收集起来最后汇总。
+    const results: TargetResult[] = []
+
     for (const target of resolveChatTargets(account)) {
-      const { name: targetName, kind } = target
-      const targetLabel = kind === 'group' ? '群聊' : '好友'
-
-      console.log(`[${account.name}] 开始搜索${targetLabel}：${targetName}`)
-
-      const searchResult = await searchConversation(page, searchInput, account.name, targetName)
-
-      if (!searchResult) {
-        await captureFailureScreenshot(page, `${account.name}-${kind}-${targetName}-search`)
-        console.log(`[${account.name}] 找不到搜索结果，已跳过${targetLabel}：${targetName}`)
-        missingTargets.push(target)
-        continue
-      }
-
-      await openConversation(searchResult, targetLabel)
-      console.log(`[${account.name}] 已打开会话：${targetName}`)
-
-      const editorInput = page
-        .locator(
-          '.messageEditorimChatEditorContainer [data-slate-editor="true"][contenteditable="true"]',
+      try {
+        results.push(
+          await deliverToTarget(
+            page,
+            searchInput,
+            account,
+            target,
+            yiyans,
+            needsYiyan,
+            includeYiyanSource,
+          ),
         )
-        .first()
-      await editorInput.waitFor({ state: 'visible', timeout: 10000 })
-      await editorInput.click()
-
-      let message: string
-
-      if (account.messageTemplate !== undefined) {
-        message = renderMessageTemplate(
-          account.messageTemplate,
-          account.name,
-          targetName,
-          needsYiyan ? pickRandomYiyan(yiyans) : undefined,
-        )
-      } else {
-        const yiyan = pickRandomYiyan(yiyans)
-        message = includeYiyanSource ? `${yiyan.hitokoto}\n——「${yiyan.from}」` : yiyan.hitokoto
+      } catch (error) {
+        // 兜底：即使投递过程抛出未预料的异常，也只记为这个目标失败，继续处理下一个。
+        results.push({ target, outcome: 'failed', detail: toError(error).message })
       }
-
-      await page.keyboard.insertText(message)
-      await page.keyboard.press('Enter')
-      console.log(`[${account.name}] 已发送消息：${targetName}`)
-      await page.waitForTimeout(1000)
     }
 
-    await page.waitForTimeout(5000)
+    logTargetSummary(account.name, results)
 
-    if (missingTargets.length > 0) {
-      throw new Error(describeMissingTargets(missingTargets))
+    await page.waitForTimeout(2000)
+
+    // 有任何一个目标没成功，就让这次运行失败，确保失败邮件能把问题送到人眼前。
+    if (results.some((result) => result.outcome !== 'sent')) {
+      throw new Error(describeTargetResults(results))
     }
 
     console.log(`账号执行完成：${account.name}`)
@@ -266,39 +267,248 @@ async function openConversation(searchResult: Locator, targetLabel: string): Pro
 }
 
 /**
- * 汇总未命中的目标，并按好友、群聊分别给出排查建议。
+ * 完成一个目标的完整投递：搜索 → 打开会话 → 校验会话标题 → 发送 → 校验已发出。
  *
- * 两类目标失败原因差异较大：好友多半是改了昵称，群聊多半是群名不一致或已退群。
+ * 每一步都做校验：
+ * 1. 搜索未命中 → 记为 skipped（不抛错，避免连累其它目标）；
+ * 2. 打开后的会话标题与目标不一致 → 记为 failed 并中止，宁可不发也不发错人；
+ * 3. 发送后输入框仍有残留 → 记为 failed，避免把「假成功」当成成功。
  *
- * @param missingTargets 本轮未命中的目标列表。
- * @returns 面向用户的错误说明。
+ * @returns 该目标的执行结果；正常路径不抛异常，异常由调用方兜底记录。
  */
-function describeMissingTargets(missingTargets: ChatTarget[]): string {
-  const missingNames = missingTargets
-    .filter((target) => target.kind === 'friend')
-    .map((target) => target.name)
-  const missingGroups = missingTargets
-    .filter((target) => target.kind === 'group')
-    .map((target) => target.name)
-  const sections = ['以下会话未找到，火花可能已经中断：']
+async function deliverToTarget(
+  page: Page,
+  searchInput: Locator,
+  account: DouyinAccount,
+  target: ChatTarget,
+  yiyans: Yiyan[],
+  needsYiyan: boolean,
+  includeYiyanSource: boolean,
+): Promise<TargetResult> {
+  const targetLabel = target.kind === 'group' ? '群聊' : '好友'
+  const logPrefix = `[${account.name}]`
 
-  if (missingNames.length > 0) {
-    sections.push(
-      `好友：${missingNames.join('、')}。` +
-        `好友改昵称是最常见的原因，建议在抖音中为好友设置备注名，` +
-        `并把备注名填入账号的 targetNames，这样好友再改昵称也不会影响续火。`,
+  console.log(`${logPrefix} 开始处理${targetLabel}：${target.name}`)
+
+  const searchResult = await searchConversation(page, searchInput, account.name, target.name)
+
+  if (!searchResult) {
+    await captureFailureScreenshot(page, `${account.name}-${target.kind}-${target.name}-search`)
+    console.log(`${logPrefix} 搜索结果未命中：${target.name}`)
+    return { target, outcome: 'skipped', detail: '搜索结果里找不到这个会话名' }
+  }
+
+  await openConversation(searchResult, targetLabel)
+
+  const conversationTitle = await waitForConversationTitle(page, target.name)
+
+  if (!conversationTitle) {
+    const actualTitle = await readConversationTitle(page)
+    await captureFailureScreenshot(page, `${account.name}-${target.kind}-${target.name}-title`)
+    const detail =
+      `会话标题与目标不一致，已中止以免发错人` +
+      `（期望包含「${target.name}」，实际打开的是「${actualTitle || '读不到标题'}」）`
+    console.log(`${logPrefix} ${detail}`)
+    return { target, outcome: 'failed', detail }
+  }
+
+  console.log(`${logPrefix} 已确认会话：${conversationTitle}`)
+
+  const editorInput = page.locator(CHAT_EDITOR_SELECTOR).first()
+  await editorInput.waitFor({ state: 'visible', timeout: EDITOR_READY_TIMEOUT })
+
+  const message = buildMessage(account, target.name, yiyans, needsYiyan, includeYiyanSource)
+
+  await sendMessageWithVerification(page, editorInput, message, conversationTitle, account.name)
+
+  console.log(`${logPrefix} 已发送消息：${target.name}`)
+  await page.waitForTimeout(1000)
+
+  return { target, outcome: 'sent', detail: `已发送到「${conversationTitle}」` }
+}
+
+/**
+ * 按配置的消息模板或默认一言格式生成要发送的文本。
+ */
+function buildMessage(
+  account: DouyinAccount,
+  targetName: string,
+  yiyans: Yiyan[],
+  needsYiyan: boolean,
+  includeYiyanSource: boolean,
+): string {
+  if (account.messageTemplate !== undefined) {
+    return renderMessageTemplate(
+      account.messageTemplate,
+      account.name,
+      targetName,
+      needsYiyan ? pickRandomYiyan(yiyans) : undefined,
     )
   }
 
-  if (missingGroups.length > 0) {
+  const yiyan = pickRandomYiyan(yiyans)
+  return includeYiyanSource ? `${yiyan.hitokoto}\n——「${yiyan.from}」` : yiyan.hitokoto
+}
+
+/**
+ * 读取当前右侧会话的标题。
+ */
+async function readConversationTitle(page: Page): Promise<string> {
+  return (
+    await page
+      .locator(CONVERSATION_TITLE_SELECTOR)
+      .first()
+      .innerText()
+      .catch(() => '')
+  ).trim()
+}
+
+/**
+ * 等待右侧会话标题变成目标会话。
+ *
+ * 搜索结果出现不等于会话已经切换完成：切换有延迟，此时直接输入会把消息发到上一个会话的人那里。
+ * 因此以标题为判据，标题里包含目标名才算就绪（群聊标题带人数后缀，如「群名(5)」，用包含判断即可）。
+ *
+ * @returns 匹配到的标题；超时仍未匹配则返回 undefined，由调用方中止该目标。
+ */
+async function waitForConversationTitle(
+  page: Page,
+  targetName: string,
+): Promise<string | undefined> {
+  const deadline = Date.now() + CONVERSATION_TITLE_TIMEOUT
+
+  while (Date.now() < deadline) {
+    const title = await readConversationTitle(page)
+
+    if (title.includes(targetName)) {
+      return title
+    }
+
+    await delay(TITLE_POLL_INTERVAL)
+  }
+
+  return undefined
+}
+
+/**
+ * 发送消息并校验真的发出去了。
+ *
+ * 判据是「输入框是否被清空」：发出去了抖音会清空编辑器，回车被吞或被打断时文字会留在里面。
+ * 未清空就重试，仍失败则抛错，由调用方记为失败——避免把假成功当成成功。
+ */
+async function sendMessageWithVerification(
+  page: Page,
+  editorInput: Locator,
+  message: string,
+  conversationTitle: string,
+  accountName: string,
+): Promise<void> {
+  for (let attempt = 1; attempt <= SEND_ATTEMPT_LIMIT; attempt += 1) {
+    await editorInput.click()
+    await page.keyboard.insertText(message)
+    await page.keyboard.press('Enter')
+
+    if (await waitForEditorCleared(editorInput)) {
+      return
+    }
+
+    const leftover = (await editorInput.innerText().catch(() => '')).trim()
+    console.log(
+      `[${accountName}] 在「${conversationTitle}」发送后输入框仍有残留，疑似假成功，准备重试（第 ${attempt} 次）：${leftover.slice(0, 30)}`,
+    )
+    await page.waitForTimeout(1500)
+  }
+
+  throw new Error(
+    `发送后输入框仍有内容残留，判定为假成功（消息未真正发出）：${message.trim().slice(0, 30)}`,
+  )
+}
+
+/**
+ * 等待输入框被清空。
+ */
+async function waitForEditorCleared(editorInput: Locator): Promise<boolean> {
+  const deadline = Date.now() + SEND_VERIFY_TIMEOUT
+
+  while (Date.now() < deadline) {
+    const text = await editorInput.innerText().catch(() => null)
+
+    if (text !== null && text.trim() === '') {
+      return true
+    }
+
+    await delay(SEND_VERIFY_INTERVAL)
+  }
+
+  return false
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds)
+  })
+}
+
+/**
+ * 把每个目标的执行结果打到日志里，一眼能看出谁成功、谁没成功。
+ */
+function logTargetSummary(accountName: string, results: TargetResult[]): void {
+  const sent = results.filter((result) => result.outcome === 'sent')
+  const skipped = results.filter((result) => result.outcome === 'skipped')
+  const failed = results.filter((result) => result.outcome === 'failed')
+
+  console.log(
+    `[${accountName}] 续火汇总：成功 ${sent.length}、未命中 ${skipped.length}、失败 ${failed.length}（共 ${results.length} 个目标）`,
+  )
+
+  for (const result of results) {
+    const label =
+      result.outcome === 'sent'
+        ? '✅ 已发送'
+        : result.outcome === 'skipped'
+          ? '⏭️ 未命中'
+          : '❌ 失败'
+    console.log(`[${accountName}]   ${label}｜${result.target.name}：${result.detail}`)
+  }
+}
+
+/**
+ * 汇总各目标结果，供抛出异常（触发失败邮件）时使用，并按好友、群聊分别给出排查建议。
+ */
+function describeTargetResults(results: TargetResult[]): string {
+  const sent = results.filter((result) => result.outcome === 'sent')
+  const skipped = results.filter((result) => result.outcome === 'skipped')
+  const failed = results.filter((result) => result.outcome === 'failed')
+  const sections = [
+    `本次续火未全部成功：成功 ${sent.length}、未命中 ${skipped.length}、失败 ${failed.length}（共 ${results.length} 个目标）`,
+  ]
+
+  if (sent.length > 0) {
+    sections.push(`已成功发送：${sent.map((result) => result.target.name).join('、')}`)
+  }
+
+  for (const result of [...skipped, ...failed]) {
+    const label = result.outcome === 'skipped' ? '未命中' : '失败'
+    sections.push(`${label}｜${result.target.name}：${result.detail}`)
+  }
+
+  const unsuccessful = [...skipped, ...failed]
+
+  if (unsuccessful.some((result) => result.target.kind === 'friend')) {
     sections.push(
-      `群聊：${missingGroups.join('、')}。` +
-        `请确认群名与抖音内显示的名称完全一致（标点、空格、表情都要一致），` +
-        `并确认你仍在群内、群没有被解散。`,
+      '好友未命中或失败时，最常见的原因是改了昵称：建议在抖音中为好友设置备注名，' +
+        '并把备注名填入账号的 targetNames，这样好友再改昵称也不会影响续火。',
     )
   }
 
-  return sections.join('')
+  if (unsuccessful.some((result) => result.target.kind === 'group')) {
+    sections.push(
+      '群聊未命中或失败时，请确认群名与抖音内显示的名称完全一致（标点、空格、表情都要一致），' +
+        '并确认你仍在群内、群没有被解散。',
+    )
+  }
+
+  return sections.join('\n')
 }
 
 /**
