@@ -132,3 +132,6 @@ dist
 .pnp.*
 
 /.idea
+
+# Mimosa 插件运行状态
+.mimosa/
