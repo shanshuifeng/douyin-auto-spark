@@ -3,11 +3,59 @@ name: 🚀 续一次火
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 0,2,4 * * *"
       timezone: "Asia/Shanghai"
 
+permissions:
+  actions: read
+  contents: read
+
 jobs:
+  check:
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-22.04
+    outputs:
+      should_run: ${{ steps.daily-check.outputs.should_run }}
+      is_retry: ${{ steps.daily-check.outputs.is_retry }}
+
+    steps:
+      - name: 检查当天是否已有成功运行 (Check today's successful run)
+        id: daily-check
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const now = new Date();
+            const beijingNow = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+            const beijingDate = beijingNow.toISOString().slice(0, 10);
+            const dayStart = new Date(`${beijingDate}T00:00:00+08:00`);
+            const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+
+            const { data } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'renew-fire.yml',
+              per_page: 100,
+            });
+
+            const previousRunsToday = data.workflow_runs.filter((run) => {
+              if (run.id === Number(context.runId)) return false;
+              const createdAt = new Date(run.created_at);
+              return createdAt >= dayStart && createdAt < dayEnd;
+            });
+            const hasSuccessfulRun = previousRunsToday.some(
+              (run) => run.conclusion === 'success',
+            );
+            const isRetry = !hasSuccessfulRun && previousRunsToday.length > 0;
+
+            core.setOutput('should_run', hasSuccessfulRun ? 'false' : 'true');
+            core.setOutput('is_retry', isRetry ? 'true' : 'false');
+            core.info(
+              `Beijing date ${beijingDate}: previous runs=${previousRunsToday.length}, successful=${hasSuccessfulRun}, retry=${isRetry}`,
+            );
+
   run:
+    needs: check
+    if: ${{ always() && (github.event_name != 'schedule' || needs.check.outputs.should_run == 'true') }}
     runs-on: ubuntu-22.04
     container:
       image: mcr.microsoft.com/playwright:v1.61.0-jammy
@@ -23,14 +71,27 @@ jobs:
       - name: 安装 Bun (Set up Bun)
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.3.14
 
       - name: 安装运行时依赖 (Install dependencies)
         run: bun install --production --ignore-scripts
 
       - name: 续一次火 (Run spark job)
         env:
+          # 抖音偶发字体问题兼容
+          PW_TEST_SCREENSHOT_NO_FONTS_READY: "1"
+          # DOUYIN_ACCOUNTS 仅用于兼容历史配置；新多账号配置请使用编号分片。
           DOUYIN_ACCOUNTS: ${{ secrets.DOUYIN_ACCOUNTS }}
+          DOUYIN_ACCOUNTS_1: ${{ secrets.DOUYIN_ACCOUNTS_1 }}
+          DOUYIN_ACCOUNTS_2: ${{ secrets.DOUYIN_ACCOUNTS_2 }}
+          DOUYIN_ACCOUNTS_3: ${{ secrets.DOUYIN_ACCOUNTS_3 }}
+          DOUYIN_ACCOUNTS_4: ${{ secrets.DOUYIN_ACCOUNTS_4 }}
+          DOUYIN_ACCOUNTS_5: ${{ secrets.DOUYIN_ACCOUNTS_5 }}
+          DOUYIN_ACCOUNTS_6: ${{ secrets.DOUYIN_ACCOUNTS_6 }}
+          DOUYIN_ACCOUNTS_7: ${{ secrets.DOUYIN_ACCOUNTS_7 }}
+          DOUYIN_ACCOUNTS_8: ${{ secrets.DOUYIN_ACCOUNTS_8 }}
+          DOUYIN_ACCOUNTS_9: ${{ secrets.DOUYIN_ACCOUNTS_9 }}
+          DOUYIN_ACCOUNTS_10: ${{ secrets.DOUYIN_ACCOUNTS_10 }}
           DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
           DOUYIN_TARGET_NAMES: ${{ secrets.DOUYIN_TARGET_NAMES }}
           DOUYIN_TARGET_GROUPS: ${{ secrets.DOUYIN_TARGET_GROUPS }}
@@ -39,17 +100,48 @@ jobs:
           SPARK_MESSAGES: ${{ secrets.SPARK_MESSAGES }}
         run: bun src/main.ts
 
-      - name: 发送失败邮件 (Send failure email)
-        if: ${{ failure() }}
+      - name: 检查邮件配置 (Check mail configuration)
+        id: mail-config
+        if: ${{ always() }}
+        env:
+          MAIL_ADDRESS: ${{ secrets.MAIL_ADDRESS }}
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+        run: |
+          if [ -n "$MAIL_ADDRESS" ] && [ -n "$MAIL_USERNAME" ] && [ -n "$MAIL_PASSWORD" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 发送补充执行成功邮件 (Send retry success email)
+        if: ${{ success() && github.event_name == 'schedule' && needs.check.outputs.is_retry == 'true' && steps.mail-config.outputs.enabled == 'true' }}
         uses: dawidd6/action-send-mail@v18
         with:
-          server_address: smtp.qq.com
-          server_port: 465
-          secure: true
+          server_address: ${{ secrets.MAIL_HOST || 'smtp.qq.com' }}
+          server_port: ${{ secrets.MAIL_PORT || '465' }}
+          secure: ${{ secrets.MAIL_SECURE || 'true' }}
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: 今天有续火失败了，但是已经补充执行成功啦！
+          to: ${{ secrets.MAIL_TO || secrets.MAIL_ADDRESS }}
+          from: ${{ secrets.MAIL_ADDRESS }}
+          body: |
+            今天有续火失败了，但是已经补充执行成功啦！
+            仓库：${{ github.repository }}
+            运行链接：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: 发送失败邮件 (Send failure email)
+        if: ${{ failure() && steps.mail-config.outputs.enabled == 'true' && (github.event_name != 'schedule' || needs.check.outputs.is_retry != 'true') }}
+        uses: dawidd6/action-send-mail@v18
+        with:
+          server_address: ${{ secrets.MAIL_HOST || 'smtp.qq.com' }}
+          server_port: ${{ secrets.MAIL_PORT || '465' }}
+          secure: ${{ secrets.MAIL_SECURE || 'true' }}
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
           subject: 抖音续火任务失败
-          to: ${{ secrets.MAIL_ADDRESS }}
+          to: ${{ secrets.MAIL_TO || secrets.MAIL_ADDRESS }}
           from: ${{ secrets.MAIL_ADDRESS }}
           attachments: artifacts/*.png
           body: |

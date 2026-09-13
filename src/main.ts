@@ -15,6 +15,7 @@ dayjs.extend(timezone)
 dayjs.locale('zh-cn')
 
 const DOUYIN_ACCOUNTS_KEY = 'DOUYIN_ACCOUNTS'
+const DOUYIN_ACCOUNTS_SHARD_PATTERN = /^DOUYIN_ACCOUNTS_(\d+)$/
 const DOUYIN_COOKIE_KEY = 'DOUYIN_COOKIE'
 const DOUYIN_TARGET_NAMES_KEY = 'DOUYIN_TARGET_NAMES'
 const DOUYIN_TARGET_GROUPS_KEY = 'DOUYIN_TARGET_GROUPS'
@@ -770,15 +771,16 @@ function renderMessageTemplate(
 }
 
 /**
- * 解析多账号配置。未配置新变量时，回退到旧的单账号变量。
+ * 解析多账号配置。支持历史变量 DOUYIN_ACCOUNTS 与按编号拆分的 DOUYIN_ACCOUNTS_N，
+ * 所有存在的配置会按历史变量、分片编号升序合并；没有多账号配置时回退到单账号变量。
  */
 function resolveDouyinAccounts(
   globalMessageTemplate: string | undefined,
   globalMessages: string[] | undefined,
 ): DouyinAccount[] {
-  const accountsText = process.env[DOUYIN_ACCOUNTS_KEY]?.trim()
+  const accountSources = resolveDouyinAccountSources()
 
-  if (!accountsText) {
+  if (accountSources.length === 0) {
     return [
       assertAccountHasTargets({
         name: '默认账号',
@@ -791,49 +793,85 @@ function resolveDouyinAccounts(
     ]
   }
 
-  const accountsValue = parseJson(accountsText, DOUYIN_ACCOUNTS_KEY)
-
-  if (!Array.isArray(accountsValue) || accountsValue.length === 0) {
-    throw new Error(`${DOUYIN_ACCOUNTS_KEY} 必须是非空账号数组 JSON`)
-  }
-
   const accountNames = new Set<string>()
 
-  return accountsValue.map((value, index) => {
-    const sourceName = `${DOUYIN_ACCOUNTS_KEY}[${index}]`
+  return accountSources.flatMap(({ sourceName, text }) => {
+    const accountsValue = parseJson(text, sourceName)
 
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-      throw new Error(`${sourceName} 必须是账号对象`)
+    if (!Array.isArray(accountsValue) || accountsValue.length === 0) {
+      throw new Error(`${sourceName} 必须是非空账号数组 JSON`)
     }
 
-    const accountValue = value as Record<string, unknown>
-    const name = resolveAccountName(accountValue.name, sourceName)
+    return accountsValue.map((value, index) => {
+      const accountSourceName = `${sourceName}[${index}]`
 
-    if (accountNames.has(name)) {
-      throw new Error(`${DOUYIN_ACCOUNTS_KEY} 中存在重复账号名称：${name}`)
-    }
-    accountNames.add(name)
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        throw new Error(`${accountSourceName} 必须是账号对象`)
+      }
 
-    return assertAccountHasTargets({
-      name,
-      cookies: resolveCookieArray(accountValue.cookie, `${sourceName}.cookie`),
-      targetNames: resolveOptionalTargetNames(
-        accountValue.targetNames,
-        `${sourceName}.targetNames`,
-      ),
-      groupNames: resolveOptionalTargetNames(accountValue.groupNames, `${sourceName}.groupNames`),
-      messageTemplate: resolveAccountMessageTemplate(
-        accountValue.messageTemplate,
-        `${sourceName}.messageTemplate`,
-        globalMessageTemplate,
-      ),
-      messages: resolveAccountMessages(
-        accountValue.messages,
-        `${sourceName}.messages`,
-        globalMessages,
-      ),
+      const accountValue = value as Record<string, unknown>
+      const name = resolveAccountName(accountValue.name, accountSourceName)
+
+      if (accountNames.has(name)) {
+        throw new Error(`多账号配置中存在重复账号名称：${name}`)
+      }
+      accountNames.add(name)
+
+      return assertAccountHasTargets({
+        name,
+        cookies: resolveCookieArray(accountValue.cookie, `${accountSourceName}.cookie`),
+        targetNames: resolveOptionalTargetNames(
+          accountValue.targetNames,
+          `${accountSourceName}.targetNames`,
+        ),
+        groupNames: resolveOptionalTargetNames(
+          accountValue.groupNames,
+          `${accountSourceName}.groupNames`,
+        ),
+        messageTemplate: resolveAccountMessageTemplate(
+          accountValue.messageTemplate,
+          `${accountSourceName}.messageTemplate`,
+          globalMessageTemplate,
+        ),
+        messages: resolveAccountMessages(
+          accountValue.messages,
+          `${accountSourceName}.messages`,
+          globalMessages,
+        ),
+      })
     })
   })
+}
+
+function resolveDouyinAccountSources(): Array<{ sourceName: string; text: string }> {
+  const sources: Array<{ sourceName: string; text: string }> = []
+  const legacyText = process.env[DOUYIN_ACCOUNTS_KEY]?.trim()
+
+  if (legacyText) {
+    sources.push({ sourceName: DOUYIN_ACCOUNTS_KEY, text: legacyText })
+  }
+
+  const shardSources: Array<{ index: number; sourceName: string; text: string }> = []
+
+  for (const [sourceName, value] of Object.entries(process.env)) {
+    const match = sourceName.match(DOUYIN_ACCOUNTS_SHARD_PATTERN)
+    const text = value?.trim()
+
+    if (!match || !text) {
+      continue
+    }
+
+    shardSources.push({
+      index: Number(match[1]),
+      sourceName,
+      text,
+    })
+  }
+
+  shardSources.sort((left, right) => left.index - right.index)
+  sources.push(...shardSources.map(({ sourceName, text }) => ({ sourceName, text })))
+
+  return sources
 }
 
 function resolveAccountName(value: unknown, sourceName: string): string {
@@ -923,7 +961,7 @@ function resolveLegacyDouyinCookies(): Cookie[] {
 
   if (!douyinCookieText) {
     throw new Error(
-      `请设置 ${DOUYIN_ACCOUNTS_KEY}，或继续使用旧版 ${DOUYIN_COOKIE_KEY} 和 ${DOUYIN_TARGET_NAMES_KEY}`,
+      `请设置 ${DOUYIN_COOKIE_KEY} 和 ${DOUYIN_TARGET_NAMES_KEY}；多账号请使用 ${DOUYIN_ACCOUNTS_KEY}_1 等分片变量`,
     )
   }
 
