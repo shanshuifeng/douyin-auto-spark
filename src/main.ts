@@ -20,6 +20,7 @@ const DOUYIN_TARGET_NAMES_KEY = 'DOUYIN_TARGET_NAMES'
 const DOUYIN_TARGET_GROUPS_KEY = 'DOUYIN_TARGET_GROUPS'
 const YIYAN_INCLUDE_SOURCE_KEY = 'YIYAN_INCLUDE_SOURCE'
 const SPARK_MESSAGE_TEMPLATE_KEY = 'SPARK_MESSAGE_TEMPLATE'
+const SPARK_MESSAGES_KEY = 'SPARK_MESSAGES'
 const FAILURE_SCREENSHOT_DIRECTORY = 'artifacts'
 
 const CHAT_PAGE_READY_TIMEOUT = 30000
@@ -85,6 +86,8 @@ interface DouyinAccount {
   targetNames: string[]
   /** 需要发消息的群名称，未配置时为空数组 */
   groupNames: string[]
+  /** 自定义随机句子池：每次发送随机挑一条；未配置时回退到 messageTemplate 或默认一言 */
+  messages: string[] | undefined
   messageTemplate: string | undefined
 }
 
@@ -97,7 +100,8 @@ async function main(): Promise<void> {
   const autoClose = resolveAutoClose()
   const includeYiyanSource = resolveYiyanIncludeSource()
   const globalMessageTemplate = resolveSparkMessageTemplate()
-  const accounts = resolveDouyinAccounts(globalMessageTemplate)
+  const globalMessages = resolveSparkMessages()
+  const accounts = resolveDouyinAccounts(globalMessageTemplate, globalMessages)
   const yiyans = await resolveYiyans()
   const browser = await chromium.launch({
     headless,
@@ -178,25 +182,13 @@ async function runDouyinAccount(
 
     await waitForChatListReady(page, account.name)
 
-    const needsYiyan =
-      account.messageTemplate === undefined ||
-      /\{\{\s*(yiyan|from)\s*\}\}/.test(account.messageTemplate)
-
     // 逐个目标独立执行：某一个目标出错不会中断后面的目标，结果统一收集起来最后汇总。
     const results: TargetResult[] = []
 
     for (const target of resolveChatTargets(account)) {
       try {
         results.push(
-          await deliverToTarget(
-            page,
-            searchInput,
-            account,
-            target,
-            yiyans,
-            needsYiyan,
-            includeYiyanSource,
-          ),
+          await deliverToTarget(page, searchInput, account, target, yiyans, includeYiyanSource),
         )
       } catch (error) {
         // 兜底：即使投递过程抛出未预料的异常，也只记为这个目标失败，继续处理下一个。
@@ -282,7 +274,6 @@ async function deliverToTarget(
   account: DouyinAccount,
   target: ChatTarget,
   yiyans: Yiyan[],
-  needsYiyan: boolean,
   includeYiyanSource: boolean,
 ): Promise<TargetResult> {
   const targetLabel = target.kind === 'group' ? '群聊' : '好友'
@@ -317,7 +308,7 @@ async function deliverToTarget(
   const editorInput = page.locator(CHAT_EDITOR_SELECTOR).first()
   await editorInput.waitFor({ state: 'visible', timeout: EDITOR_READY_TIMEOUT })
 
-  const message = buildMessage(account, target.name, yiyans, needsYiyan, includeYiyanSource)
+  const message = buildMessage(account, target.name, yiyans, includeYiyanSource)
 
   await sendMessageWithVerification(page, editorInput, message, conversationTitle, account.name)
 
@@ -328,24 +319,38 @@ async function deliverToTarget(
 }
 
 /**
- * 按配置的消息模板或默认一言格式生成要发送的文本。
+ * 生成要发送的文本。
+ *
+ * 优先级：自定义随机句子池 > 消息模板 > 默认一言。
+ * 句子池与模板都支持占位符；句子池每次发送随机挑一条。
  */
 function buildMessage(
   account: DouyinAccount,
   targetName: string,
   yiyans: Yiyan[],
-  needsYiyan: boolean,
   includeYiyanSource: boolean,
 ): string {
+  const pickYiyan = (template: string) =>
+    /\{\{\s*(yiyan|from)\s*\}\}/.test(template) ? pickRandomYiyan(yiyans) : undefined
+
+  // 1. 自定义随机句子池：每次随机挑一条，占位符照常替换
+  if (account.messages !== undefined && account.messages.length > 0) {
+    const picked = account.messages[Math.floor(Math.random() * account.messages.length)]
+
+    return renderMessageTemplate(picked, account.name, targetName, pickYiyan(picked))
+  }
+
+  // 2. 固定消息模板
   if (account.messageTemplate !== undefined) {
     return renderMessageTemplate(
       account.messageTemplate,
       account.name,
       targetName,
-      needsYiyan ? pickRandomYiyan(yiyans) : undefined,
+      pickYiyan(account.messageTemplate),
     )
   }
 
+  // 3. 默认：随机一言
   const yiyan = pickRandomYiyan(yiyans)
   return includeYiyanSource ? `${yiyan.hitokoto}\n——「${yiyan.from}」` : yiyan.hitokoto
 }
@@ -767,7 +772,10 @@ function renderMessageTemplate(
 /**
  * 解析多账号配置。未配置新变量时，回退到旧的单账号变量。
  */
-function resolveDouyinAccounts(globalMessageTemplate: string | undefined): DouyinAccount[] {
+function resolveDouyinAccounts(
+  globalMessageTemplate: string | undefined,
+  globalMessages: string[] | undefined,
+): DouyinAccount[] {
   const accountsText = process.env[DOUYIN_ACCOUNTS_KEY]?.trim()
 
   if (!accountsText) {
@@ -777,6 +785,7 @@ function resolveDouyinAccounts(globalMessageTemplate: string | undefined): Douyi
         cookies: resolveLegacyDouyinCookies(),
         targetNames: resolveLegacyDouyinTargetNames(),
         groupNames: resolveLegacyDouyinTargetGroups(),
+        messages: globalMessages,
         messageTemplate: globalMessageTemplate,
       }),
     ]
@@ -818,6 +827,11 @@ function resolveDouyinAccounts(globalMessageTemplate: string | undefined): Douyi
         `${sourceName}.messageTemplate`,
         globalMessageTemplate,
       ),
+      messages: resolveAccountMessages(
+        accountValue.messages,
+        `${sourceName}.messages`,
+        globalMessages,
+      ),
     })
   })
 }
@@ -845,6 +859,60 @@ function resolveAccountMessageTemplate(
 
   const template = value.trim()
   return template ? normalizeMessageTemplate(template, sourceName) : globalMessageTemplate
+}
+
+/**
+ * 解析全局自定义句子池：一个 JSON 字符串数组，每次发送随机挑一条。
+ */
+function resolveSparkMessages(): string[] | undefined {
+  const messagesText = process.env[SPARK_MESSAGES_KEY]?.trim()
+
+  if (!messagesText) {
+    return undefined
+  }
+
+  return resolveMessages(parseJson(messagesText, SPARK_MESSAGES_KEY), SPARK_MESSAGES_KEY)
+}
+
+/**
+ * 解析账号级句子池；未配置时回退到全局句子池。
+ */
+function resolveAccountMessages(
+  value: unknown,
+  sourceName: string,
+  globalMessages: string[] | undefined,
+): string[] | undefined {
+  if (value === undefined || value === null) {
+    return globalMessages
+  }
+
+  return resolveMessages(value, sourceName)
+}
+
+/**
+ * 校验句子池：必须是字符串数组，每个元素都按模板一样校验占位符并支持字面 \n。
+ * 未配置或空数组都视为「未配置」，回退到其它消息来源。
+ */
+function resolveMessages(value: unknown, sourceName: string): string[] | undefined {
+  if (value === undefined || value === null) {
+    return undefined
+  }
+
+  if (!Array.isArray(value)) {
+    throw new Error(`${sourceName} 必须是字符串数组，形如 ["句子1","句子2"]`)
+  }
+
+  if (value.length === 0) {
+    return undefined
+  }
+
+  return value.map((item, index) => {
+    if (typeof item !== 'string' || !item.trim()) {
+      throw new Error(`${sourceName}[${index}] 必须是非空字符串`)
+    }
+
+    return normalizeMessageTemplate(item, `${sourceName}[${index}]`)
+  })
 }
 
 /**

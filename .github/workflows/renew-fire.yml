@@ -36,6 +36,7 @@ jobs:
           DOUYIN_TARGET_GROUPS: ${{ secrets.DOUYIN_TARGET_GROUPS }}
           YIYAN_INCLUDE_SOURCE: ${{ secrets.YIYAN_INCLUDE_SOURCE }}
           SPARK_MESSAGE_TEMPLATE: ${{ secrets.SPARK_MESSAGE_TEMPLATE }}
+          SPARK_MESSAGES: ${{ secrets.SPARK_MESSAGES }}
         run: bun src/main.ts
 
       - name: 发送失败邮件 (Send failure email)
