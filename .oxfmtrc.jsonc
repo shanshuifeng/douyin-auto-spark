@@ -8,7 +8,8 @@
     "coverage",
     "**/*.{yml,yaml}",
     "assets/yiyan.json",
-    "**/*.md"
+    "**/*.md",
+    ".mimosa"
   ],
   "overrides": [
     {
