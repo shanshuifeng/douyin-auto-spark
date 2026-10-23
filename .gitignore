@@ -138,3 +138,7 @@ dist
 
 # Playwright 持久化配置目录（含登录态）
 .chrome-profile
+
+# 续火运行状态与日志
+.last-run.json
+logs/
