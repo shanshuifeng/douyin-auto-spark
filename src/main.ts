@@ -1057,12 +1057,14 @@ function resolveDouyinAccounts(
   globalMessages: string[] | undefined,
 ): DouyinAccount[] {
   const accountSources = resolveDouyinAccountSources()
+  // 持久化 profile 模式下登录态由浏览器自己维护，不需要 Cookie。
+  const cookiesRequired = !resolvePersistentProfile()
 
   if (accountSources.length === 0) {
     return [
       assertAccountHasTargets({
         name: '默认账号',
-        cookies: resolveLegacyDouyinCookies(),
+        cookies: cookiesRequired ? resolveLegacyDouyinCookies() : [],
         targetNames: resolveLegacyDouyinTargetNames(),
         groupNames: resolveLegacyDouyinTargetGroups(),
         messages: globalMessages,
