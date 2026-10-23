@@ -48,6 +48,36 @@ const SEND_VERIFY_TIMEOUT = 4000
 const SEND_VERIFY_INTERVAL = 300
 const SEND_ATTEMPT_LIMIT = 2
 
+/**
+ * 反检测模式下使用的 User-Agent。
+ *
+ * Playwright 无头模式默认 UA 含 `HeadlessChrome`，是明显的自动化特征，
+ * 这里替换为同版本号的正规 Chrome UA。
+ */
+const STEALTH_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36'
+
+/**
+ * 持久化配置模式下，等待用户扫码登录的最长时间。
+ */
+const LOGIN_WAIT_TIMEOUT = 5 * 60 * 1000
+
+/**
+ * 编辑器里可能残留的「不可见字符」。
+ *
+ * 抖音的富文本编辑器（Slate）在发送后会留下零宽空格、BOM、方向标记等不可见字符，
+ * 肉眼与 innerText 都显示为空，但字符串长度不为 0。若直接比较空串就会误判为
+ * 「输入框没清空」，进而重复发送同一条消息。
+ */
+const INVISIBLE_CHARS_PATTERN = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/g
+
+/**
+ * 判断编辑器内容是否已经清空（忽略不可见字符）。
+ */
+function isEditorTextEmpty(text: string): boolean {
+  return text.replace(INVISIBLE_CHARS_PATTERN, '').trim() === ''
+}
+
 const MESSAGE_TEMPLATE_PLACEHOLDER_PATTERN = /\{\{\s*([a-zA-Z]+)\s*\}\}/g
 const MESSAGE_TEMPLATE_PLACEHOLDERS = [
   'account',
@@ -104,16 +134,44 @@ async function main(): Promise<void> {
   const globalMessages = resolveSparkMessages()
   const accounts = resolveDouyinAccounts(globalMessageTemplate, globalMessages)
   const yiyans = await resolveYiyans()
+  const stealth = resolveStealth()
+  const persistent = resolvePersistentProfile()
+
+  if (persistent) {
+    await runWithPersistentProfile({
+      browserPath,
+      headless,
+      autoClose,
+      includeYiyanSource,
+      accounts,
+      yiyans,
+      stealth,
+    })
+    return
+  }
+
   const browser = await chromium.launch({
     headless,
     ...(browserPath ? { executablePath: browserPath } : {}),
+    ...(stealth
+      ? {
+          // 去掉 Playwright 默认注入的自动化标志，并关闭 Chrome 的「正受自动测试软件控制」提示。
+          ignoreDefaultArgs: ['--enable-automation'],
+          args: [
+            '--disable-blink-features=AutomationControlled',
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-features=IsolateOrigins,site-per-process',
+          ],
+        }
+      : {}),
   })
   const failures: Error[] = []
 
   try {
     for (const account of accounts) {
       try {
-        await runDouyinAccount(browser, account, yiyans, includeYiyanSource, autoClose)
+        await runDouyinAccount(browser, account, yiyans, includeYiyanSource, autoClose, stealth)
       } catch (error) {
         const accountError = toError(error)
         failures.push(
@@ -143,6 +201,118 @@ async function main(): Promise<void> {
 }
 
 /**
+ * 使用持久化浏览器配置运行：登录态保存在本地目录，无需手动导出 Cookie。
+ *
+ * 首次运行时（目录为空或未登录）会打开一个可见的 Chrome 窗口，
+ * 等待你在窗口里扫码登录，登录成功后再继续执行续火。
+ */
+async function runWithPersistentProfile(options: {
+  browserPath: string | undefined
+  headless: boolean
+  autoClose: boolean
+  includeYiyanSource: boolean
+  accounts: DouyinAccount[]
+  yiyans: Yiyan[]
+  stealth: boolean
+}): Promise<void> {
+  const { browserPath, autoClose, includeYiyanSource, accounts, yiyans, stealth } = options
+  const profileDir = resolveProfileDir()
+  await mkdir(profileDir, { recursive: true })
+
+  console.log(`使用持久化配置目录：${profileDir}`)
+
+  // 持久化模式下必须可见，否则用户无法扫码登录。
+  const context = await chromium.launchPersistentContext(profileDir, {
+    headless: false,
+    ...(browserPath ? { executablePath: browserPath } : {}),
+    ...(stealth
+      ? {
+          ignoreDefaultArgs: ['--enable-automation'],
+          args: [
+            '--disable-blink-features=AutomationControlled',
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-features=IsolateOrigins,site-per-process',
+          ],
+          locale: 'zh-CN',
+          timezoneId: 'Asia/Shanghai',
+          userAgent: STEALTH_USER_AGENT,
+          viewport: { width: 1440, height: 900 },
+        }
+      : {}),
+  })
+
+  if (stealth) {
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined,
+        configurable: true,
+      })
+    })
+  }
+
+  try {
+    const page = context.pages()[0] ?? (await context.newPage())
+    await page.goto('https://www.douyin.com/chat', { waitUntil: 'domcontentloaded' })
+
+    const searchInput = page.locator('input.semi-input[placeholder="搜索"]').first()
+    let ready = await searchInput
+      .waitFor({ state: 'visible', timeout: CHAT_PAGE_READY_TIMEOUT })
+      .then(() => true)
+      .catch(() => false)
+
+    if (!ready) {
+      // 未登录：给用户足够时间在打开的窗口里扫码。
+      console.log('未检测到登录态，请在打开的 Chrome 窗口中扫码登录抖音。')
+      console.log(`等待登录中（最多 ${Math.round(LOGIN_WAIT_TIMEOUT / 1000)} 秒）...`)
+
+      ready = await searchInput
+        .waitFor({ state: 'visible', timeout: LOGIN_WAIT_TIMEOUT })
+        .then(() => true)
+        .catch(() => false)
+
+      if (!ready) {
+        throw new Error('登录超时，请重新运行并在弹出的窗口中完成扫码登录')
+      }
+
+      console.log('登录成功，登录态已保存到配置目录，下次运行无需再次登录。')
+    } else {
+      console.log('已复用本地保存的登录态。')
+    }
+
+    const failures: Error[] = []
+
+    for (const account of accounts) {
+      try {
+        console.log(`开始执行账号：${account.name}`)
+        await waitForChatListReady(page, account.name)
+        await deliverAllTargets(page, searchInput, account, yiyans, includeYiyanSource)
+        console.log(`账号执行完成：${account.name}`)
+      } catch (error) {
+        const accountError = toError(error)
+        await captureFailureScreenshot(page, account.name)
+        failures.push(
+          new Error(`[${account.name}] ${accountError.message}`, { cause: accountError }),
+        )
+        console.error(`账号执行失败：${account.name}`, accountError)
+      }
+    }
+
+    if (!autoClose) {
+      const readline = createInterface({ input, output })
+      await readline.question('所有账号已执行完成，按回车键关闭浏览器...')
+      readline.close()
+    }
+
+    if (failures.length > 0) {
+      throw new AggregateError(failures, `${failures.length} 个抖音账号执行失败`)
+    }
+  } finally {
+    await context.close()
+  }
+}
+
+/**
  * 使用独立浏览器上下文执行一个抖音账号，避免不同账号的 Cookie 相互污染。
  *
  * @param browser Playwright 浏览器实例。
@@ -158,8 +328,31 @@ async function runDouyinAccount(
   yiyans: Yiyan[],
   includeYiyanSource: boolean,
   autoClose: boolean,
+  stealth = true,
 ): Promise<void> {
-  const context = await browser.newContext()
+  const context = await browser.newContext(
+    stealth
+      ? {
+          // 伪装成真实的 Windows Chrome：去掉 HeadlessChrome 标识、对齐本地时区与语言。
+          locale: 'zh-CN',
+          timezoneId: 'Asia/Shanghai',
+          userAgent: STEALTH_USER_AGENT,
+          viewport: { width: 1440, height: 900 },
+          screen: { width: 1440, height: 900 },
+        }
+      : {},
+  )
+
+  if (stealth) {
+    // navigator.webdriver 是 W3C 规范里最直接的自动化标志，正常浏览器为 undefined。
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined,
+        configurable: true,
+      })
+    })
+  }
+
   let page: Page | undefined
 
   try {
@@ -183,28 +376,7 @@ async function runDouyinAccount(
 
     await waitForChatListReady(page, account.name)
 
-    // 逐个目标独立执行：某一个目标出错不会中断后面的目标，结果统一收集起来最后汇总。
-    const results: TargetResult[] = []
-
-    for (const target of resolveChatTargets(account)) {
-      try {
-        results.push(
-          await deliverToTarget(page, searchInput, account, target, yiyans, includeYiyanSource),
-        )
-      } catch (error) {
-        // 兜底：即使投递过程抛出未预料的异常，也只记为这个目标失败，继续处理下一个。
-        results.push({ target, outcome: 'failed', detail: toError(error).message })
-      }
-    }
-
-    logTargetSummary(account.name, results)
-
-    await page.waitForTimeout(2000)
-
-    // 有任何一个目标没成功，就让这次运行失败，确保失败邮件能把问题送到人眼前。
-    if (results.some((result) => result.outcome !== 'sent')) {
-      throw new Error(describeTargetResults(results))
-    }
+    await deliverAllTargets(page, searchInput, account, yiyans, includeYiyanSource)
 
     console.log(`账号执行完成：${account.name}`)
   } catch (error) {
@@ -214,6 +386,48 @@ async function runDouyinAccount(
     if (autoClose) {
       await context.close()
     }
+  }
+}
+
+/**
+ * 依次把消息投递给账号下所有目标，并汇总结果。
+ *
+ * 每个目标独立 try/catch：某一个失败不会中断后面的目标。
+ * 只要有目标没成功就抛错，确保调用方能把这次运行标记为失败。
+ *
+ * @param page 已登录且停留在聊天页的页面。
+ * @param searchInput 聊天页的搜索框。
+ * @param account 当前账号配置。
+ * @param yiyans 一言列表。
+ * @param includeYiyanSource 是否携带一言出处。
+ */
+async function deliverAllTargets(
+  page: Page,
+  searchInput: Locator,
+  account: DouyinAccount,
+  yiyans: Yiyan[],
+  includeYiyanSource: boolean,
+): Promise<void> {
+  const results: TargetResult[] = []
+
+  for (const target of resolveChatTargets(account)) {
+    try {
+      results.push(
+        await deliverToTarget(page, searchInput, account, target, yiyans, includeYiyanSource),
+      )
+    } catch (error) {
+      // 兜底：即使投递过程抛出未预料的异常，也只记为这个目标失败，继续处理下一个。
+      results.push({ target, outcome: 'failed', detail: toError(error).message })
+    }
+  }
+
+  logTargetSummary(account.name, results)
+
+  await page.waitForTimeout(2000)
+
+  // 有任何一个目标没成功，就让这次运行失败，确保失败邮件能把问题送到人眼前。
+  if (results.some((result) => result.outcome !== 'sent')) {
+    throw new Error(describeTargetResults(results))
   }
 }
 
@@ -401,6 +615,9 @@ async function waitForConversationTitle(
  *
  * 判据是「输入框是否被清空」：发出去了抖音会清空编辑器，回车被吞或被打断时文字会留在里面。
  * 未清空就重试，仍失败则抛错，由调用方记为失败——避免把假成功当成成功。
+ *
+ * 注意：抖音编辑器发送后会残留零宽字符，必须先用 isEditorTextEmpty 过滤掉再判断，
+ * 否则会把已发送成功误判成假成功并重复发送。
  */
 async function sendMessageWithVerification(
   page: Page,
@@ -419,6 +636,19 @@ async function sendMessageWithVerification(
     }
 
     const leftover = (await editorInput.innerText().catch(() => '')).trim()
+
+    // 零宽字符之外的残留才可能是真的没发出去；重试前必须确认消息不在输入框里，
+    // 否则会把同一条消息重复发给好友。
+    if (isEditorTextEmpty(leftover)) {
+      return
+    }
+
+    // 残留内容里如果不再包含原消息（例如编辑器保留了其他草稿），说明本次消息已经发出去了，
+    // 不能重试，否则会重复发送。
+    if (!leftover.includes(message.trim())) {
+      return
+    }
+
     console.log(
       `[${accountName}] 在「${conversationTitle}」发送后输入框仍有残留，疑似假成功，准备重试（第 ${attempt} 次）：${leftover.slice(0, 30)}`,
     )
@@ -439,7 +669,7 @@ async function waitForEditorCleared(editorInput: Locator): Promise<boolean> {
   while (Date.now() < deadline) {
     const text = await editorInput.innerText().catch(() => null)
 
-    if (text !== null && text.trim() === '') {
+    if (text !== null && isEditorTextEmpty(text)) {
       return true
     }
 
@@ -641,6 +871,54 @@ function resolveBrowserPath(): string | undefined {
   }
 
   return undefined
+}
+
+/**
+ * 解析是否启用「持久化浏览器配置」模式。
+ *
+ * 开启后不再需要手动导出 Cookie：脚本用本机真实 Chrome 打开抖音，
+ * 你扫码登录一次，登录态会保存在 PROFILE_DIR 指向的目录里，
+ * 之后每次运行自动复用，避免了反复导出 Cookie 的麻烦。
+ */
+function resolvePersistentProfile(): boolean {
+  const persistent = process.env.PERSISTENT_PROFILE?.trim().toLowerCase()
+
+  if (!persistent || persistent === 'false') {
+    return false
+  }
+
+  if (persistent === 'true') {
+    return true
+  }
+
+  throw new Error('PERSISTENT_PROFILE 只能配置为 true 或 false')
+}
+
+/**
+ * 解析持久化配置目录的路径。
+ */
+function resolveProfileDir(): string {
+  return process.env.PROFILE_DIR?.trim() || '.chrome-profile'
+}
+
+/**
+ * 解析是否启用反检测（隐藏 Playwright 自动化特征）。
+ *
+ * 默认开启：抖音会检测 navigator.webdriver 与 HeadlessChrome UA，
+ * 裸 Playwright 极易被判定为机器人并触发风控。
+ */
+function resolveStealth(): boolean {
+  const stealth = process.env.STEALTH?.trim().toLowerCase()
+
+  if (!stealth || stealth === 'true') {
+    return true
+  }
+
+  if (stealth === 'false') {
+    return false
+  }
+
+  throw new Error('STEALTH 只能配置为 true 或 false')
 }
 
 /**

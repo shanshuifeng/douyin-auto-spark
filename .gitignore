@@ -135,3 +135,6 @@ dist
 
 # Mimosa 插件运行状态
 .mimosa/
+
+# Playwright 持久化配置目录（含登录态）
+.chrome-profile
