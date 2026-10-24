@@ -554,6 +554,28 @@ async function deliverToTarget(
 
   const message = buildMessage(account, target.name, yiyans, includeYiyanSource)
 
+  if (resolveDryRun()) {
+    // 演练模式：只把消息填进输入框，确认能输入，然后清空，不按回车。
+    await editorInput.click()
+    await page.keyboard.insertText(message)
+    await page.waitForTimeout(300)
+    const typedOk = await editorInput
+      .innerText()
+      .then((t) => t.includes(message.trim().slice(0, 10)))
+      .catch(() => false)
+
+    // 清空输入框，避免残留内容影响下一个目标
+    await page.keyboard.press('Control+A')
+    await page.keyboard.press('Delete')
+    await page.waitForTimeout(200)
+
+    console.log(
+      `[${account.name}] [演练] 会话可用，消息已生成（${typedOk ? '输入成功' : '输入校验未通过'}），未发送：${message.slice(0, 20)}...`,
+    )
+
+    return { target, outcome: 'sent', detail: `[演练] 已定位「${conversationTitle}」，未实际发送` }
+  }
+
   await sendMessageWithVerification(page, editorInput, message, conversationTitle, account.name)
 
   console.log(`${logPrefix} 已发送消息：${target.name}`)
@@ -928,6 +950,27 @@ function resolvePersistentProfile(): boolean {
  */
 function resolveProfileDir(): string {
   return process.env.PROFILE_DIR?.trim() || '.chrome-profile'
+}
+
+/**
+ * 解析是否启用演练模式。
+ *
+ * 开启后仍然完整执行「搜索会话 → 打开会话 → 校验标题 → 生成消息」，
+ * 但最后不按回车，改为清空输入框。用于验证部署与配置是否正确，
+ * 而不会真的给好友发消息。
+ */
+function resolveDryRun(): boolean {
+  const dryRun = process.env.DRY_RUN?.trim().toLowerCase()
+
+  if (!dryRun || dryRun === 'false') {
+    return false
+  }
+
+  if (dryRun === 'true') {
+    return true
+  }
+
+  throw new Error('DRY_RUN 只能配置为 true 或 false')
 }
 
 /**
