@@ -145,3 +145,7 @@ logs/
 
 # 多账号 profile 目录（含登录态）
 .chrome-profile-*
+
+# 敏感配置备份，禁止提交
+.env.bak
+.env.*.bak
