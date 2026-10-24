@@ -113,6 +113,13 @@ interface TargetResult {
 interface DouyinAccount {
   name: string
   cookies: Cookie[]
+  /**
+   * 持久化模式下该账号专属的浏览器配置目录。
+   *
+   * 每个账号必须独立，否则多个账号会共用同一份登录态，
+   * 导致消息全部从同一个账号发出。未配置时按序号自动生成。
+   */
+  profileDir: string | undefined
   /** 需要续火的好友会话名 */
   targetNames: string[]
   /** 需要发消息的群名称，未配置时为空数组 */
@@ -201,10 +208,11 @@ async function main(): Promise<void> {
 }
 
 /**
- * 使用持久化浏览器配置运行：登录态保存在本地目录，无需手动导出 Cookie。
+ * 使用持久化浏览器配置运行。
  *
- * 首次运行时（目录为空或未登录）会打开一个可见的 Chrome 窗口，
- * 等待你在窗口里扫码登录，登录成功后再继续执行续火。
+ * 每个账号使用独立的 profile 目录与独立的浏览器实例：
+ * 登录态保存在各自目录里，首次运行时该账号对应的窗口会等待扫码，
+ * 之后每次运行自动复用，无需手动导出 Cookie。
  */
 async function runWithPersistentProfile(options: {
   browserPath: string | undefined
@@ -215,11 +223,48 @@ async function runWithPersistentProfile(options: {
   yiyans: Yiyan[]
   stealth: boolean
 }): Promise<void> {
-  const { browserPath, autoClose, includeYiyanSource, accounts, yiyans, stealth } = options
-  const profileDir = resolveProfileDir()
+  const { autoClose, accounts } = options
+  const failures: Error[] = []
+
+  for (const [index, account] of accounts.entries()) {
+    try {
+      await runAccountWithPersistentProfile(options, account, index)
+    } catch (error) {
+      const accountError = toError(error)
+      failures.push(new Error(`[${account.name}] ${accountError.message}`, { cause: accountError }))
+      console.error(`账号执行失败：${account.name}`, accountError)
+    }
+  }
+
+  if (!autoClose && failures.length === 0) {
+    const readline = createInterface({ input, output })
+    await readline.question('所有账号已执行完成，按回车键关闭...')
+    readline.close()
+  }
+
+  if (failures.length > 0) {
+    throw new AggregateError(failures, `${failures.length} 个抖音账号执行失败`)
+  }
+}
+
+/**
+ * 用该账号专属的 profile 目录跑一轮续火。
+ */
+async function runAccountWithPersistentProfile(
+  options: {
+    browserPath: string | undefined
+    includeYiyanSource: boolean
+    yiyans: Yiyan[]
+    stealth: boolean
+  },
+  account: DouyinAccount,
+  index: number,
+): Promise<void> {
+  const { browserPath, includeYiyanSource, yiyans, stealth } = options
+  const profileDir = account.profileDir ?? defaultProfileDirForIndex(index)
   await mkdir(profileDir, { recursive: true })
 
-  console.log(`使用持久化配置目录：${profileDir}`)
+  console.log(`[${account.name}] 使用持久化配置目录：${profileDir}`)
 
   // 持久化模式下必须可见，否则用户无法扫码登录。
   const context = await chromium.launchPersistentContext(profileDir, {
@@ -251,8 +296,10 @@ async function runWithPersistentProfile(options: {
     })
   }
 
+  let page: Page | undefined
+
   try {
-    const page = context.pages()[0] ?? (await context.newPage())
+    page = context.pages()[0] ?? (await context.newPage())
     await page.goto('https://www.douyin.com/chat', { waitUntil: 'domcontentloaded' })
 
     const searchInput = page.locator('input.semi-input[placeholder="搜索"]').first()
@@ -263,8 +310,10 @@ async function runWithPersistentProfile(options: {
 
     if (!ready) {
       // 未登录：给用户足够时间在打开的窗口里扫码。
-      console.log('未检测到登录态，请在打开的 Chrome 窗口中扫码登录抖音。')
-      console.log(`等待登录中（最多 ${Math.round(LOGIN_WAIT_TIMEOUT / 1000)} 秒）...`)
+      console.log(`[${account.name}] 未检测到登录态，请在打开的 Chrome 窗口中扫码登录。`)
+      console.log(
+        `[${account.name}] 等待登录中（最多 ${Math.round(LOGIN_WAIT_TIMEOUT / 1000)} 秒）...`,
+      )
 
       ready = await searchInput
         .waitFor({ state: 'visible', timeout: LOGIN_WAIT_TIMEOUT })
@@ -275,38 +324,18 @@ async function runWithPersistentProfile(options: {
         throw new Error('登录超时，请重新运行并在弹出的窗口中完成扫码登录')
       }
 
-      console.log('登录成功，登录态已保存到配置目录，下次运行无需再次登录。')
+      console.log(`[${account.name}] 登录成功，登录态已保存到 ${profileDir}。`)
     } else {
-      console.log('已复用本地保存的登录态。')
+      console.log(`[${account.name}] 已复用本地保存的登录态。`)
     }
 
-    const failures: Error[] = []
-
-    for (const account of accounts) {
-      try {
-        console.log(`开始执行账号：${account.name}`)
-        await waitForChatListReady(page, account.name)
-        await deliverAllTargets(page, searchInput, account, yiyans, includeYiyanSource)
-        console.log(`账号执行完成：${account.name}`)
-      } catch (error) {
-        const accountError = toError(error)
-        await captureFailureScreenshot(page, account.name)
-        failures.push(
-          new Error(`[${account.name}] ${accountError.message}`, { cause: accountError }),
-        )
-        console.error(`账号执行失败：${account.name}`, accountError)
-      }
-    }
-
-    if (!autoClose) {
-      const readline = createInterface({ input, output })
-      await readline.question('所有账号已执行完成，按回车键关闭浏览器...')
-      readline.close()
-    }
-
-    if (failures.length > 0) {
-      throw new AggregateError(failures, `${failures.length} 个抖音账号执行失败`)
-    }
+    console.log(`开始执行账号：${account.name}`)
+    await waitForChatListReady(page, account.name)
+    await deliverAllTargets(page, searchInput, account, yiyans, includeYiyanSource)
+    console.log(`账号执行完成：${account.name}`)
+  } catch (error) {
+    await captureFailureScreenshot(page, account.name)
+    throw error
   } finally {
     await context.close()
   }
@@ -1065,6 +1094,8 @@ function resolveDouyinAccounts(
       assertAccountHasTargets({
         name: '默认账号',
         cookies: cookiesRequired ? resolveLegacyDouyinCookies() : [],
+        // 单账号模式直接复用 PROFILE_DIR，保持既有目录不变。
+        profileDir: undefined,
         targetNames: resolveLegacyDouyinTargetNames(),
         groupNames: resolveLegacyDouyinTargetGroups(),
         messages: globalMessages,
@@ -1075,7 +1106,7 @@ function resolveDouyinAccounts(
 
   const accountNames = new Set<string>()
 
-  return accountSources.flatMap(({ sourceName, text }) => {
+  const accounts = accountSources.flatMap(({ sourceName, text }) => {
     const accountsValue = parseJson(text, sourceName)
 
     if (!Array.isArray(accountsValue) || accountsValue.length === 0) {
@@ -1099,7 +1130,11 @@ function resolveDouyinAccounts(
 
       return assertAccountHasTargets({
         name,
-        cookies: resolveCookieArray(accountValue.cookie, `${accountSourceName}.cookie`),
+        // 持久化模式下登录态来自 profile 目录，cookie 可以不配。
+        cookies: cookiesRequired
+          ? resolveCookieArray(accountValue.cookie, `${accountSourceName}.cookie`)
+          : [],
+        profileDir: resolveAccountProfileDir(accountValue.profileDir, accountSourceName),
         targetNames: resolveOptionalTargetNames(
           accountValue.targetNames,
           `${accountSourceName}.targetNames`,
@@ -1121,6 +1156,58 @@ function resolveDouyinAccounts(
       })
     })
   })
+
+  assertUniqueProfileDirs(accounts)
+  return accounts
+}
+
+/**
+ * 解析账号里可选的 profileDir 字段。
+ *
+ * 未配置时返回 undefined，由调用方按账号序号自动分配，
+ * 保证每个账号都有独立的登录态目录。
+ */
+function resolveAccountProfileDir(value: unknown, sourceName: string): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined
+  }
+
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error(`${sourceName}.profileDir 必须是非空字符串`)
+  }
+
+  return value.trim()
+}
+
+/**
+ * 校验多个账号的 profile 目录互不重复。
+ *
+ * 目录重复会导致多个账号共用同一份登录态，消息全从同一个账号发出。
+ */
+function assertUniqueProfileDirs(accounts: DouyinAccount[]): void {
+  const seen = new Map<string, string>()
+
+  accounts.forEach((account, index) => {
+    const dir = account.profileDir ?? defaultProfileDirForIndex(index)
+
+    const previous = seen.get(dir)
+    if (previous !== undefined) {
+      throw new Error(
+        `账号「${previous}」与「${account.name}」使用了相同的 profileDir：${dir}。` +
+          '持久化模式下一个目录只能对应一个账号，请为每个账号配置不同的目录。',
+      )
+    }
+
+    seen.set(dir, account.name)
+  })
+}
+
+/**
+ * 多账号场景下按序号生成默认的 profile 目录。
+ */
+function defaultProfileDirForIndex(index: number): string {
+  const base = resolveProfileDir()
+  return index === 0 ? base : `${base}-${index + 1}`
 }
 
 function resolveDouyinAccountSources(): Array<{ sourceName: string; text: string }> {

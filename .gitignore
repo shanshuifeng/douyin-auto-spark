@@ -142,3 +142,6 @@ dist
 # 续火运行状态与日志
 .last-run.json
 logs/
+
+# 多账号 profile 目录（含登录态）
+.chrome-profile-*
